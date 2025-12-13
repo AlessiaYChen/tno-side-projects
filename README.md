@@ -8,6 +8,40 @@ This proof of concept now focuses entirely on an automated **Analyze -> Decide -
 
 There is no dependency on Microsoft Foundry / Azure Media Services anymore.
 
+## System Architecture
+
+### End-to-end flow
+```
++----------------+      +--------------------+      +---------------------+      +------------------+
+| Local Media    | ---> | Video Indexer (VI) | ---> | Transcript Store &  | ---> | Azure OpenAI LLM |
+| (raw newscast) |      |  Analyze           |      | Cache               |      |  Decide          |
++----------------+      +--------------------+      +---------------------+      +------------------+
+        |                     ^                           |                            |
+        | (skip via cache)    | metadata + transcripts     | transcripts/prompts        |
+        v                     |                           v                            v
++------------------+     +---------------------------------------+                +------------------+
+| Automated Clip   |<----| Automated Clip Pipeline (Analyze ->   |<---------------| Boundary Refinement|
+| Pipeline driver  |     | Decide -> Act orchestrator)           |                +------------------+
++------------------+     +-------------------------------+-------+
+                                                    |
+                                                    v
+                                           +------------------+
+                                           | FFmpeg Clip      |
+                                           | Cutter (Act)     |
+                                           +------------------+
+                                                    |
+                                                    v
+                                           +------------------+
+                                           | Output Clips     |
+                                           +------------------+
+```
+
+### Pipeline highlights
+- **Ingest**: enumerate raw files, optionally pull cached Video Indexer insights when `--skip-video-indexer` is set, otherwise upload and poll VI until transcripts are ready.
+- **Decide**: flatten VI transcripts into overlapping blocks, ask Azure OpenAI to assign stories, build candidate transition windows, and run a second GPT pass per boundary for precise offsets.
+- **Act**: build clip plans (either GPT-driven or VI topic-based via `--news-clips-from-vi`), save transcript windows for provenance, and invoke FFmpeg with optional dry-run/tail padding.
+- **Outputs**: per-story clips, cached insights, and LLM prompt/response artifacts under the configured `--llm-output` directory for auditing.
+
 ## Repository Layout
 ```
 audio-video-editing/
@@ -84,6 +118,7 @@ Flags:
 - `--dry-run` - log upload + cut plans without calling Video Indexer or FFmpeg.
 - `--label <slug>` - changes the slug used for Video Indexer upload names and output file suffixes.
 - `--news-clips` - automatically split the transcript into sequential news stories and cut each one locally.
+- `--news-clips-from-vi` - plan news clips directly from Video Indexer topic appearances (skips Azure OpenAI).
 
 Every clip currently includes an automatic +2 second tail padding before FFmpeg runs so that anchors don't get cut off mid-sentence.
 

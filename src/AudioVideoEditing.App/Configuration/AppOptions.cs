@@ -17,6 +17,7 @@ internal sealed class AppOptions
     public string OpenAiDeployment { get; private set; } = string.Empty;
     public string JobLabel { get; private set; } = "tno-media";
     public bool GenerateNewsClips { get; private set; }
+    public bool UseVideoIndexerNewsClips { get; private set; }
     public bool SkipVideoIndexer { get; private set; }
     public string InsightsCacheRoot { get; private set; } = string.Empty;
     public string LlmOutputRoot { get; private set; } = string.Empty;
@@ -65,6 +66,10 @@ internal sealed class AppOptions
                     break;
                 case "--news-clips":
                     options.GenerateNewsClips = true;
+                    break;
+                case "--news-clips-from-vi":
+                    options.GenerateNewsClips = true;
+                    options.UseVideoIndexerNewsClips = true;
                     break;
                 case "--skip-video-indexer":
                     options.SkipVideoIndexer = true;

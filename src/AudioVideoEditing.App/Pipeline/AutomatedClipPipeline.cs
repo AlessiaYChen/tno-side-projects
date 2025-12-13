@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.Linq;
+using System.Text.Json;
 
 using AudioVideoEditing.App.Configuration;
 using AudioVideoEditing.App.Models;
@@ -14,6 +15,10 @@ internal sealed class AutomatedClipPipeline
     private readonly OpenAiStoryLocator _storyLocator;
     private readonly FfmpegClipCutter _clipCutter;
     private static readonly TimeSpan TailPadding = TimeSpan.FromSeconds(2);
+    private static readonly JsonSerializerOptions TranscriptWindowSerializerOptions = new()
+    {
+        WriteIndented = true
+    };
 
     public AutomatedClipPipeline(VideoIndexerClient videoIndexerClient, OpenAiStoryLocator storyLocator, FfmpegClipCutter clipCutter)
     {
@@ -77,17 +82,18 @@ internal sealed class AutomatedClipPipeline
         if (options.GenerateNewsClips)
         {
             var llmOutputPath = LlmOutputStore.BuildPath(options.LlmOutputRoot, filePath, ".news.json");
-            await GenerateNewsClipsAsync(filePath, transcript, options, llmOutputPath, cancellationToken);
+            await GenerateNewsClipsAsync(filePath, transcript, insights, options, llmOutputPath, cancellationToken);
             return;
         }
 
-        await GenerateTopicClipAsync(filePath, transcript, options, outputPath, cancellationToken);
+        await GenerateTopicClipAsync(filePath, transcript, insights, options, outputPath, cancellationToken);
     }
 
-    private async Task GenerateTopicClipAsync(string filePath, TranscriptDocument transcript, AppOptions options, string outputPath, CancellationToken cancellationToken)
+    private async Task GenerateTopicClipAsync(string filePath, TranscriptDocument transcript, VideoIndexerInsights insights, AppOptions options, string outputPath, CancellationToken cancellationToken)
     {
         Console.WriteLine("Calling Azure OpenAI to locate the requested topic...");
         var clipRange = await _storyLocator.LocateClipAsync(transcript.Text, options.TopicQuery, options.OpenAiDeployment, cancellationToken);
+        await SaveTopicTranscriptWindowAsync(filePath, insights, options, clipRange, cancellationToken);
         var paddedRange = ApplyTailPadding(clipRange);
         Console.WriteLine($"Topic '{options.TopicQuery}' located between {clipRange.Start:c} and {clipRange.End:c}. Cutting {paddedRange.Start:c}-{paddedRange.End:c} locally (includes +{TailPadding.TotalSeconds:0.#}s tail padding).");
 
@@ -95,10 +101,21 @@ internal sealed class AutomatedClipPipeline
         Console.WriteLine($"[SUCCESS] {Path.GetFileName(filePath)} -> {outputPath}");
     }
 
-    private async Task GenerateNewsClipsAsync(string filePath, TranscriptDocument transcript, AppOptions options, string llmOutputPath, CancellationToken cancellationToken)
+    private async Task GenerateNewsClipsAsync(string filePath, TranscriptDocument transcript, VideoIndexerInsights insights, AppOptions options, string llmOutputPath, CancellationToken cancellationToken)
     {
-        Console.WriteLine("Calling Azure OpenAI to segment the transcript into news clips...");
-        var clips = await _storyLocator.PlanNewsClipsAsync(transcript, options.OpenAiDeployment, llmOutputPath, cancellationToken);
+        IReadOnlyList<NewsClipPlan> clips;
+        if (options.UseVideoIndexerNewsClips)
+        {
+            Console.WriteLine("Using Video Indexer topic appearances to plan news clips...");
+            clips = PlanVideoIndexerNewsClips(insights);
+        }
+        else
+        {
+            Console.WriteLine("Calling Azure OpenAI to segment the transcript into news clips...");
+            clips = await _storyLocator.PlanNewsClipsAsync(transcript, options.OpenAiDeployment, llmOutputPath, cancellationToken);
+        }
+
+        await SaveNewsTranscriptWindowsAsync(filePath, clips, insights, options, cancellationToken);
 
         var clipIndex = 1;
         foreach (var clip in clips)
@@ -111,6 +128,128 @@ internal sealed class AutomatedClipPipeline
         }
 
         Console.WriteLine($"[SUCCESS] Produced {clips.Count} clips from {Path.GetFileName(filePath)}.");
+    }
+
+    private static async Task SaveTopicTranscriptWindowAsync(string filePath, VideoIndexerInsights insights, AppOptions options, ClipRange clipRange, CancellationToken cancellationToken)
+    {
+        var windowPath = LlmOutputStore.BuildPath(options.LlmOutputRoot, filePath, ".topic.window.json");
+        var record = BuildTranscriptWindowRecord(1, options.TopicQuery, clipRange, insights);
+        var json = JsonSerializer.Serialize(record, TranscriptWindowSerializerOptions);
+        await LlmOutputStore.SaveAsync(windowPath, json, cancellationToken);
+        Console.WriteLine($"Saved VI transcript window -> {windowPath}");
+    }
+
+    private static async Task SaveNewsTranscriptWindowsAsync(string filePath, IReadOnlyList<NewsClipPlan> clips, VideoIndexerInsights insights, AppOptions options, CancellationToken cancellationToken)
+    {
+        if (clips.Count == 0)
+        {
+            return;
+        }
+
+        var windowsPath = LlmOutputStore.BuildPath(options.LlmOutputRoot, filePath, ".news.windows.json");
+        var payload = new List<TranscriptWindowRecord>(clips.Count);
+        var clipIndex = 1;
+        foreach (var clip in clips)
+        {
+            payload.Add(BuildTranscriptWindowRecord(clipIndex, clip.Title, clip.Range, insights));
+            clipIndex++;
+        }
+
+        var json = JsonSerializer.Serialize(payload, TranscriptWindowSerializerOptions);
+        await LlmOutputStore.SaveAsync(windowsPath, json, cancellationToken);
+        Console.WriteLine($"Saved VI transcript windows -> {windowsPath}");
+    }
+
+    private static TranscriptWindowRecord BuildTranscriptWindowRecord(int clipIndex, string? title, ClipRange range, VideoIndexerInsights insights)
+    {
+        var transcript = TranscriptFormatter.BuildWindow(insights, range.Start, range.End);
+        return new TranscriptWindowRecord(clipIndex, title, TimestampHelper.Format(range.Start), TimestampHelper.Format(range.End), transcript);
+    }
+
+    private sealed record TranscriptWindowRecord(int ClipIndex, string? Title, string Start, string End, string Transcript);
+
+    private static IReadOnlyList<NewsClipPlan> PlanVideoIndexerNewsClips(VideoIndexerInsights insights)
+    {
+        if (insights.Videos.Count == 0)
+        {
+            throw new InvalidOperationException("Video Indexer insights payload does not contain any videos.");
+        }
+
+        var topicSegments = new List<NewsClipPlan>();
+        var videoInsights = insights.Videos[0].Insights;
+        foreach (var topic in videoInsights.Topics)
+        {
+            if (topic.Appearances.Count == 0)
+            {
+                continue;
+            }
+
+            foreach (var appearance in topic.Appearances)
+            {
+                var range = BuildClipRange(appearance);
+                if (range is null)
+                {
+                    continue;
+                }
+
+                var title = string.IsNullOrWhiteSpace(topic.Name) ? string.Empty : topic.Name.Trim();
+                topicSegments.Add(new NewsClipPlan(title, range));
+            }
+        }
+
+        if (topicSegments.Count == 0)
+        {
+            throw new InvalidOperationException("Video Indexer topics did not contain usable clip segments.");
+        }
+
+        var ordered = topicSegments
+            .OrderBy(plan => plan.Range.Start)
+            .Select((plan, index) =>
+            {
+                var title = string.IsNullOrWhiteSpace(plan.Title) ? $"vi-story-{index + 1:00}" : plan.Title;
+                return plan with { Title = title };
+            })
+            .ToList();
+
+        return ordered;
+    }
+
+    private static ClipRange? BuildClipRange(VideoIndexerAppearance appearance)
+    {
+        var start = ResolveAppearanceTime(appearance.StartSeconds, appearance.StartTime, appearance.Start);
+        var end = ResolveAppearanceTime(appearance.EndSeconds, appearance.EndTime, appearance.End);
+        if (start is null || end is null)
+        {
+            return null;
+        }
+
+        var startValue = start.Value < TimeSpan.Zero ? TimeSpan.Zero : start.Value;
+        var endValue = end.Value < startValue ? startValue : end.Value;
+        if (endValue <= startValue)
+        {
+            endValue = startValue + TimeSpan.FromSeconds(1);
+        }
+
+        return new ClipRange(startValue, endValue);
+    }
+
+    private static TimeSpan? ResolveAppearanceTime(double? seconds, string? primary, string? fallback)
+    {
+        if (seconds.HasValue)
+        {
+            var value = seconds.Value;
+            if (!double.IsNaN(value) && !double.IsInfinity(value))
+            {
+                if (value < 0)
+                {
+                    value = 0;
+                }
+
+                return TimeSpan.FromSeconds(value);
+            }
+        }
+
+        return TimestampHelper.Parse(primary) ?? TimestampHelper.Parse(fallback);
     }
 
     private static ClipRange ApplyTailPadding(ClipRange range)
@@ -129,4 +268,3 @@ internal sealed class AutomatedClipPipeline
         return range with { End = paddedEnd };
     }
 }
-

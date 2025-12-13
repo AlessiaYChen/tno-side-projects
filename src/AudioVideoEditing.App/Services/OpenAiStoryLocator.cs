@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Text;
@@ -17,6 +18,8 @@ internal sealed class OpenAiStoryLocator
     {
         PropertyNameCaseInsensitive = true
     };
+    private static readonly TimeSpan TransitionWindowDuration = TimeSpan.FromSeconds(20);
+    private static readonly TimeSpan TransitionWindowLeadIn = TimeSpan.FromSeconds(5);
 
     private readonly HttpClient _httpClient;
     private readonly OpenAiSettings _settings;
@@ -27,6 +30,10 @@ internal sealed class OpenAiStoryLocator
 A ""story"" is a self-contained news item on a single topic.
 Do not split a story just because the speaker changes if they are still on the same topic.
 Do split when the topic clearly changes.";
+    private const string BoundarySystemPrompt = @"You are a precise news segmentation assistant.
+You are given a short excerpt of a radio news transcript where one story ends and the next begins.
+Your task is to return the exact moment within this window where the topic changes between the two stories.
+Return valid JSON only.";
 
     private const string NewsUserPromptTemplate = @"You are given blocks of transcript with IDs and timestamps.
 
@@ -37,6 +44,8 @@ Your task:
 1. Assign a story_id to each block. Blocks with the same story_id belong to the same story.
 2. story_id must be integers starting at 1 and increasing; do not skip numbers.
 3. A story must contain at least 2 blocks unless the broadcast is extremely short.
+4. The displayed timestamps may overlap slightly to show more context, but block IDs are sequential 20-second windows and never overlap.
+5. Metadata hints (speaker, sentiment, topic keywords) appear in parentheses after the timestamps. Prefer to start a new story when the speaker changes and the topic hints differ from the previous block.
 
 Output JSON in this format only:
 
@@ -50,6 +59,24 @@ Output JSON in this format only:
 
 Blocks:
 {0}";
+
+    private const string BoundaryUserPromptTemplate = @"Window start time: {0}
+Window end time:   {1}
+
+Story before boundary: {2}
+Story after boundary: {3}
+
+Transcript within this window (offsets are seconds from window start):
+
+{4}
+
+Rules:
+- The topic change happens exactly once inside this window.
+- 0.0 <= boundary_offset_seconds <= 20.0.
+- Do NOT include any explanation text.
+
+Return JSON only in this format:
+{{ ""boundary_offset_seconds"": <number> }}";
 
     public OpenAiStoryLocator(HttpClient httpClient, OpenAiSettings settings, string apiKey)
     {
@@ -87,6 +114,7 @@ Blocks:
         }
 
         var prompt = string.Format(CultureInfo.InvariantCulture, NewsUserPromptTemplate, transcript.Text.Trim());
+        await DumpNewsPromptAsync(prompt, llmOutputPath, cancellationToken);
         var text = await ExecuteChatAsync(deploymentOverride, NewsSystemPrompt, prompt, cancellationToken);
         if (!string.IsNullOrWhiteSpace(llmOutputPath))
         {
@@ -95,7 +123,14 @@ Blocks:
         var envelope = JsonSerializer.Deserialize<StoryAssignmentEnvelope>(text, SerializerOptions)
             ?? throw new InvalidOperationException("Unable to parse GPT response for news clips.");
 
-        var plans = BuildNewsClipPlans(transcript, envelope);
+        var materials = BuildPlanMaterial(transcript, envelope);
+        if (materials.Count == 0)
+        {
+            throw new InvalidOperationException("Azure OpenAI did not return any clips.");
+        }
+
+        await RefineBoundariesAsync(materials, transcript, deploymentOverride, cancellationToken);
+        var plans = BuildNewsClipPlans(materials);
         if (plans.Count == 0)
         {
             throw new InvalidOperationException("Azure OpenAI did not return any clips.");
@@ -104,7 +139,37 @@ Blocks:
         return plans;
     }
 
-    private IReadOnlyList<NewsClipPlan> BuildNewsClipPlans(TranscriptDocument transcript, StoryAssignmentEnvelope envelope)
+    private static async Task DumpNewsPromptAsync(string prompt, string? llmOutputPath, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(prompt))
+        {
+            return;
+        }
+
+        string targetPath;
+        if (!string.IsNullOrWhiteSpace(llmOutputPath))
+        {
+            var directory = Path.GetDirectoryName(llmOutputPath);
+            var fileName = Path.GetFileNameWithoutExtension(llmOutputPath);
+            targetPath = Path.Combine(directory ?? string.Empty, $"{fileName}.prompt.txt");
+        }
+        else
+        {
+            var tempRoot = Path.Combine(Path.GetTempPath(), "audio-video-editing", "llm-prompts");
+            Directory.CreateDirectory(tempRoot);
+            targetPath = Path.Combine(tempRoot, $"news-{DateTime.UtcNow:yyyyMMddHHmmssfff}.prompt.txt");
+        }
+
+        var targetDirectory = Path.GetDirectoryName(targetPath);
+        if (!string.IsNullOrWhiteSpace(targetDirectory))
+        {
+            Directory.CreateDirectory(targetDirectory);
+        }
+
+        await File.WriteAllTextAsync(targetPath, prompt, cancellationToken);
+    }
+
+    private List<StoryPlanMaterial> BuildPlanMaterial(TranscriptDocument transcript, StoryAssignmentEnvelope envelope)
     {
         if (envelope.Blocks.Count == 0)
         {
@@ -138,10 +203,10 @@ Blocks:
 
         if (orderedGroups.Count == 0)
         {
-            return Array.Empty<NewsClipPlan>();
+            return new List<StoryPlanMaterial>();
         }
 
-        var plans = new List<NewsClipPlan>(orderedGroups.Count);
+        var planMaterial = new List<StoryPlanMaterial>(orderedGroups.Count);
         var normalizedStoryId = 1;
         foreach (var group in orderedGroups)
         {
@@ -163,11 +228,178 @@ Blocks:
             }
 
             var title = BuildClipTitle(orderedBlocks, normalizedStoryId);
-            plans.Add(new NewsClipPlan(title, new ClipRange(start, end)));
+            planMaterial.Add(new StoryPlanMaterial(title, orderedBlocks, start, end));
             normalizedStoryId++;
         }
 
+        for (var index = 1; index < planMaterial.Count; index++)
+        {
+            planMaterial[index].TransitionWindow = BuildTransitionWindow(planMaterial[index - 1].Blocks, planMaterial[index].Blocks);
+        }
+
+        return planMaterial;
+    }
+
+    private static ClipRange? BuildTransitionWindow(IReadOnlyList<TranscriptBlock> previousStoryBlocks, IReadOnlyList<TranscriptBlock> nextStoryBlocks)
+    {
+        if (previousStoryBlocks.Count == 0 || nextStoryBlocks.Count == 0)
+        {
+            return null;
+        }
+
+        var previousStoryStart = previousStoryBlocks[0].Start;
+        var windowStart = previousStoryBlocks[^1].End;
+        if (TransitionWindowLeadIn > TimeSpan.Zero)
+        {
+            var candidateStart = windowStart - TransitionWindowLeadIn;
+            windowStart = candidateStart < previousStoryStart ? previousStoryStart : candidateStart;
+        }
+        var firstBlockOfNextStory = nextStoryBlocks[0];
+        var coarseWindowEnd = firstBlockOfNextStory.Start + TransitionWindowDuration;
+        if (firstBlockOfNextStory.End > coarseWindowEnd)
+        {
+            coarseWindowEnd = firstBlockOfNextStory.End;
+        }
+
+        if (coarseWindowEnd <= windowStart)
+        {
+            coarseWindowEnd = windowStart + TimeSpan.FromSeconds(1);
+        }
+
+        return new ClipRange(windowStart, coarseWindowEnd);
+    }
+
+    private static List<NewsClipPlan> BuildNewsClipPlans(IReadOnlyList<StoryPlanMaterial> materials)
+    {
+        var plans = new List<NewsClipPlan>(materials.Count);
+        foreach (var material in materials)
+        {
+            var start = material.Start < TimeSpan.Zero ? TimeSpan.Zero : material.Start;
+            var end = material.End <= start ? start + TimeSpan.FromSeconds(1) : material.End;
+            plans.Add(new NewsClipPlan(material.Title, new ClipRange(start, end), material.TransitionWindow));
+        }
+
         return plans;
+    }
+
+    private async Task RefineBoundariesAsync(IReadOnlyList<StoryPlanMaterial> materials, TranscriptDocument transcript, string? deploymentOverride, CancellationToken cancellationToken)
+    {
+        if (materials.Count < 2)
+        {
+            return;
+        }
+
+        for (var index = 1; index < materials.Count; index++)
+        {
+            var current = materials[index];
+            var previous = materials[index - 1];
+            var window = current.TransitionWindow;
+            if (window is null)
+            {
+                continue;
+            }
+
+            var previousLabel = string.IsNullOrWhiteSpace(previous.Title) ? $"Story {index}" : previous.Title;
+            var nextLabel = string.IsNullOrWhiteSpace(current.Title) ? $"Story {index + 1}" : current.Title;
+            var refined = await LocateBoundaryWithinWindowAsync(transcript, window, previousLabel, nextLabel, deploymentOverride, cancellationToken);
+            if (!refined.HasValue)
+            {
+                continue;
+            }
+
+            var boundary = refined.Value;
+            if (boundary <= previous.Start || boundary >= current.End)
+            {
+                continue;
+            }
+
+            previous.End = boundary;
+            current.Start = boundary;
+        }
+    }
+
+    private async Task<TimeSpan?> LocateBoundaryWithinWindowAsync(TranscriptDocument transcript, ClipRange window, string previousTitle, string nextTitle, string? deploymentOverride, CancellationToken cancellationToken)
+    {
+        var transcriptExcerpt = BuildBoundaryTranscriptExcerpt(transcript, window);
+        if (string.IsNullOrWhiteSpace(transcriptExcerpt))
+        {
+            return null;
+        }
+
+        var userPrompt = string.Format(CultureInfo.InvariantCulture, BoundaryUserPromptTemplate,
+            TimestampHelper.FormatWithMilliseconds(window.Start),
+            TimestampHelper.FormatWithMilliseconds(window.End),
+            previousTitle,
+            nextTitle,
+            transcriptExcerpt);
+
+        var text = await ExecuteChatAsync(deploymentOverride, BoundarySystemPrompt, userPrompt, cancellationToken);
+        var response = JsonSerializer.Deserialize<BoundaryResponse>(text, SerializerOptions);
+        if (response?.BoundaryOffsetSeconds is null)
+        {
+            return null;
+        }
+
+        var offsetSeconds = response.BoundaryOffsetSeconds.Value;
+        if (offsetSeconds < 0 || offsetSeconds > TransitionWindowDuration.TotalSeconds)
+        {
+            return null;
+        }
+
+        var boundary = window.Start + TimeSpan.FromSeconds(offsetSeconds);
+        if (boundary < window.Start || boundary > window.End)
+        {
+            return null;
+        }
+
+        return boundary;
+    }
+
+    private static string BuildBoundaryTranscriptExcerpt(TranscriptDocument transcript, ClipRange window)
+    {
+        var builder = new StringBuilder();
+        foreach (var block in transcript.Blocks)
+        {
+            if (block.End <= window.Start || block.Start >= window.End)
+            {
+                continue;
+            }
+
+            var text = SanitizeBoundaryText(block.Text);
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                continue;
+            }
+
+            var relativeStart = block.Start <= window.Start ? TimeSpan.Zero : block.Start - window.Start;
+            if (relativeStart < TimeSpan.Zero)
+            {
+                relativeStart = TimeSpan.Zero;
+            }
+
+            builder.Append("[+");
+            builder.Append(relativeStart.TotalSeconds.ToString("0.0", CultureInfo.InvariantCulture));
+            builder.Append("] \"");
+            builder.Append(text);
+            builder.AppendLine("\"");
+        }
+
+        return builder.ToString().Trim();
+    }
+
+    private static string SanitizeBoundaryText(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return string.Empty;
+        }
+
+        var normalized = text
+            .Replace('\r', ' ')
+            .Replace('\n', ' ')
+            .Trim();
+
+        return normalized.Replace('"', '\'');
     }
 
     private static string BuildClipTitle(IReadOnlyList<TranscriptBlock> blocks, int storyId)
@@ -273,6 +505,12 @@ Blocks:
         public string? End { get; init; }
     }
 
+    private sealed class BoundaryResponse
+    {
+        [JsonPropertyName("boundary_offset_seconds")]
+        public double? BoundaryOffsetSeconds { get; init; }
+    }
+
     private sealed class StoryAssignmentEnvelope
     {
         [JsonPropertyName("blocks")]
@@ -286,6 +524,23 @@ Blocks:
 
         [JsonPropertyName("story_id")]
         public int StoryId { get; init; }
+    }
+
+    private sealed class StoryPlanMaterial
+    {
+        public StoryPlanMaterial(string title, IReadOnlyList<TranscriptBlock> blocks, TimeSpan start, TimeSpan end)
+        {
+            Title = title;
+            Blocks = blocks;
+            Start = start;
+            End = end;
+        }
+
+        public string Title { get; }
+        public IReadOnlyList<TranscriptBlock> Blocks { get; }
+        public TimeSpan Start { get; set; }
+        public TimeSpan End { get; set; }
+        public ClipRange? TransitionWindow { get; set; }
     }
 }
 
