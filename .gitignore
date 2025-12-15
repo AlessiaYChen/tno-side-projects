@@ -1,5 +1,5 @@
 /ffmpeg-master-latest-win64-gpl-shared/
 /input/
 /output/
-**/bin/
-**/obj/
+/src/AudioVideoEditing.App/bin/
+/src/AudioVideoEditing.App/obj/
