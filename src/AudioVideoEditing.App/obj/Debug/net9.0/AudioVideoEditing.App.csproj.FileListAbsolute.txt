@@ -14,3 +14,4 @@ C:\repos\github\tno-side-projects\audio-video-editing\src\AudioVideoEditing.App\
 C:\repos\github\tno-side-projects\audio-video-editing\src\AudioVideoEditing.App\obj\Debug\net9.0\AudioVideoEditing.App.pdb
 C:\repos\github\tno-side-projects\audio-video-editing\src\AudioVideoEditing.App\obj\Debug\net9.0\AudioVideoEditing.App.genruntimeconfig.cache
 C:\repos\github\tno-side-projects\audio-video-editing\src\AudioVideoEditing.App\obj\Debug\net9.0\ref\AudioVideoEditing.App.dll
+C:\repos\github\tno-side-projects\audio-video-editing\src\AudioVideoEditing.App\bin\Debug\net9.0\appsettings.secrets.json

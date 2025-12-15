@@ -101,6 +101,12 @@ audio-video-editing/
 }
 ```
 
+### Local secrets
+1. Copy `src/AudioVideoEditing.App/appsettings.secrets.sample.json` to `appsettings.secrets.json` (same folder).
+2. Fill in fields like `VideoIndexer.AccountId/Location/AccessToken` and `OpenAi.Endpoint/DeploymentName/ApiKey` (or override the env var names) in that secrets file.
+3. The loader overlays secrets before applying environment variables, and `.gitignore` already excludes `appsettings.secrets.json` so it never ends up in Git.
+4. Environment variables still win if you need to override anything for CI/CD.
+
 ## Running the Automated Clip Pipeline
 From the repo root:
 ```powershell
@@ -112,6 +118,8 @@ dotnet run --project src/AudioVideoEditing.App -- `
   --openai-deployment gpt-4o-mini
 ```
 Flags:
+- `--input <dir>` - overrides the default input root (also configurable via `Processing.InputRoot`).
+- `--output <dir>` - overrides the default output root where clips, caches, and LLM artifacts land.
 - `--topic` *(required unless `--news-clips` is set)* - description of the story to locate in the transcript.
 - `--openai-deployment` - override for the Azure OpenAI deployment/model name (defaults to config/env vars).
 - `--extensions .mp4,.wmv` - filter which files are scanned.
@@ -119,6 +127,11 @@ Flags:
 - `--label <slug>` - changes the slug used for Video Indexer upload names and output file suffixes.
 - `--news-clips` - automatically split the transcript into sequential news stories and cut each one locally.
 - `--news-clips-from-vi` - plan news clips directly from Video Indexer topic appearances (skips Azure OpenAI).
+- `--skip-video-indexer` - reuse cached VI insights for each file instead of uploading again (requires a prior cached run).
+- `--insights-cache <dir>` - override the cache folder that stores/loads `VideoIndexResult.json` (defaults to `<output>/insights`).
+- `--llm-output <dir>` - override where `.topic.window.json`, `.news.json`, `.news.prompt.txt`, and `.news.windows.json` artifacts are written (defaults to `<output>/llm`).
+
+When `--skip-video-indexer` is specified the pipeline expects to find cached insights for every source file under the insights cache directory. Prime the cache by running without `--skip-video-indexer` (or copy an existing `VideoIndexResult.json` into `<insights-cache>/<file-name>/`).
 
 Every clip currently includes an automatic +2 second tail padding before FFmpeg runs so that anchors don't get cut off mid-sentence.
 
@@ -142,5 +155,6 @@ If FFmpeg is unavailable the run will fail fast; set `AUDIO_VIDEO_EDITING_FFMPEG
 
 ## Troubleshooting
 - **Access token expired:** refresh Video Indexer tokens regularly or add a helper endpoint that exchanges ARM tokens automatically.
+- **Missing cached insights when using `--skip-video-indexer`:** make one full run without the flag (or copy an existing `VideoIndexResult.json` into the insights cache) before trying to reuse transcripts; each source file needs its own cached folder.
 - **OpenAI throttling:** consider exponential back-off or chunking transcripts into smaller sections.
 - **FFmpeg errors:** confirm the binary path and ensure the input containers support `-c copy` (use transcode fallback when necessary).

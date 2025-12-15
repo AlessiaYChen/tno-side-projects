@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("AudioVideoEditing.App")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+e32a5fef48a10b958d93c4fe63b3c0fb51529cad")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+2637f5ada4585c0c0bf8762234b087d1182c9a77")]
 [assembly: System.Reflection.AssemblyProductAttribute("AudioVideoEditing.App")]
 [assembly: System.Reflection.AssemblyTitleAttribute("AudioVideoEditing.App")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
