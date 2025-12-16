@@ -90,6 +90,7 @@ internal sealed class VideoIndexerTranscriptWord
 internal sealed class VideoIndexerSpeaker
 {
     [JsonPropertyName("id")]
+    [JsonConverter(typeof(FlexibleStringConverter))]
     public string? Id { get; init; }
 
     [JsonPropertyName("name")]
